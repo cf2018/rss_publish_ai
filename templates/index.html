@@ -454,11 +454,52 @@
         });
 
         function displayResults(data) {
-            document.getElementById('post-title').textContent = data.title;
-            // Use innerHTML to render HTML formatting in the post content
-            document.getElementById('post-content').innerHTML = data.post_content;
+            // Handle different post_content formats (old string format or new structured format)
+            if (typeof data.post_content === 'string') {
+                // Original format - just a string
+                document.getElementById('post-title').textContent = data.title;
+                document.getElementById('post-content').innerHTML = data.post_content;
+            } else if (typeof data.post_content === 'object') {
+                // New structured format with title, subheading, body
+                document.getElementById('post-title').textContent = data.post_content.title || data.title;
+                
+                // Build formatted content with subheading and body
+                let formattedContent = '';
+                if (data.post_content.subheading) {
+                    formattedContent += `<h3 class="text-xl text-gray-600 italic mb-4">${data.post_content.subheading}</h3>`;
+                }
+                if (data.post_content.body) {
+                    // Convert line breaks to paragraphs
+                    const paragraphs = data.post_content.body.split('\n\n');
+                    formattedContent += paragraphs.map(p => `<p class="mb-4">${p.replace(/\n/g, '<br>')}</p>`).join('');
+                }
+                document.getElementById('post-content').innerHTML = formattedContent;
+            } else {
+                // Fallback for unexpected format
+                document.getElementById('post-title').textContent = data.title;
+                document.getElementById('post-content').innerHTML = 
+                    `<p class="text-red-500">Error: Could not display content in expected format.</p>`;
+            }
+            
+            // Set the image
             document.getElementById('generated-image').src = data.image_url;
             document.getElementById('image-description').textContent = data.image_description;
+            
+            // Show image source information
+            const imageStatus = document.createElement('div');
+            imageStatus.className = 'text-xs text-gray-500 mt-1';
+            imageStatus.textContent = data.image_generation === 'AI-generated' ? 
+                'AI-generated image' : 'Stock image from Unsplash';
+            
+            const imgDescriptionEl = document.getElementById('image-description');
+            // Remove any existing status element
+            const existingStatus = imgDescriptionEl.nextElementSibling;
+            if (existingStatus && existingStatus.classList.contains('text-xs')) {
+                existingStatus.remove();
+            }
+            imgDescriptionEl.parentNode.insertBefore(imageStatus, imgDescriptionEl.nextSibling);
+            
+            // Show results section
             document.getElementById('results').classList.remove('hidden');
             
             // Add processing indicator if content is still being generated
