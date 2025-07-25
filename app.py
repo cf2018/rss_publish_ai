@@ -4,7 +4,7 @@ import logging
 from flask import Flask, render_template, request, jsonify, flash, redirect, url_for
 import feedparser
 import google.genai
-from google.genai.types import HarmCategory, HarmBlockThreshold, GenerateImagesConfig
+from google.genai.types import HarmCategory, HarmBlockThreshold, GenerateImagesConfig, GenerateContentConfig
 import requests
 from dotenv import load_dotenv
 import json
@@ -19,6 +19,36 @@ load_dotenv()
 app = Flask(__name__)
 app.secret_key = os.getenv('SECRET_KEY', 'your-secret-key-here')
 
+# Create a directory for temporary images
+TEMP_IMG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'static', 'temp')
+os.makedirs(TEMP_IMG_DIR, exist_ok=True)
+
+# Function to clean up old temporary images
+def cleanup_temp_images(max_age_hours=24):
+    """Remove temporary images older than the specified age"""
+    import time
+    import os
+    
+    try:
+        now = time.time()
+        count = 0
+        
+        for filename in os.listdir(TEMP_IMG_DIR):
+            if filename.startswith('generated_') and filename.endswith('.jpg'):
+                file_path = os.path.join(TEMP_IMG_DIR, filename)
+                # If file is older than max_age_hours, delete it
+                if os.path.isfile(file_path) and os.stat(file_path).st_mtime < (now - max_age_hours * 3600):
+                    os.remove(file_path)
+                    count += 1
+        
+        if count > 0:
+            logger.info(f"Cleaned up {count} old temporary image files")
+    except Exception as e:
+        logger.error(f"Error cleaning up temporary images: {e}")
+
+# Clean up old images at startup
+cleanup_temp_images()
+
 # Configure Gemini AI
 api_key = os.getenv('GEMINI_API_KEY')
 if not api_key:
@@ -27,7 +57,9 @@ if not api_key:
 
 client = google.genai.Client(api_key=api_key)
 
-IMAGE_GENERATION_MODEL = 'gemini-1.5-pro-vision'
+# Available Gemini models
+IMAGE_GENERATION_MODEL = 'gemini-2.0-flash-preview-image-generation'  # For image generation
+TEXT_MODEL = 'gemini-2.5-flash'  # For text generation
 
 class RSSPostGenerator:
     def __init__(self):
@@ -315,14 +347,148 @@ class RSSPostGenerator:
             }
     
     def generate_image(self, image_description):
-        """Attempt to generate an image using Gemini API or fallback to placeholder."""
+        """Generate an image using Gemini image generation model based on the description."""
         try:
-            # This is still a fallback function since we haven't implemented the actual 
-            # image generation using Gemini. In the future when Gemini image generation is available,
-            # this is where you'd implement it.
+            logger.info(f"Generating image with Gemini model '{IMAGE_GENERATION_MODEL}'")
+            logger.info(f"Image description: {image_description[:100]}...")
             
-            # For now, provide a better-looking placeholder image with the description
-            logger.info("Using enhanced placeholder image with custom styling")
+            # Enhanced prompt for better image generation
+            image_prompt = f"""
+            Create a beautiful, high-quality image that represents:
+            
+            {image_description}
+            
+            The image should be:
+            - Professional and visually appealing
+            - Suitable for a blog post header image
+            - Modern and stylish
+            - 16:9 aspect ratio for web display
+            - No text overlay or watermarks
+            """
+            
+            # Use threading to avoid blocking the main thread
+            import threading
+            import time
+            import base64
+            import tempfile
+            import os
+            from io import BytesIO
+            from PIL import Image
+            
+            response_data = [None]
+            response_error = [None]
+            request_completed = [False]
+            
+            def make_image_request():
+                try:
+                    logger.info("Starting Gemini Image API request...")
+                    # Use the image generation model
+                    response = client.models.generate_content(
+                        model=IMAGE_GENERATION_MODEL,
+                        contents=image_prompt,
+                        config=GenerateContentConfig(
+                            response_modalities=["IMAGE"],
+                            temperature=0.2,  # Lower temperature for more consistent results
+                            max_output_tokens=2048
+                        )
+                    )
+                    response_data[0] = response
+                    logger.info("Gemini Image API request completed successfully")
+                    request_completed[0] = True
+                except Exception as e:
+                    logger.error(f"Error in Gemini Image API request: {e}")
+                    response_error[0] = e
+                    request_completed[0] = True
+            
+            # Start request in a thread
+            request_thread = threading.Thread(target=make_image_request)
+            request_thread.start()
+            
+            # Wait for up to 45 seconds with status updates
+            timeout = 45  # Image generation may take longer than text
+            start_time = time.time()
+            
+            # Check progress every second and log it
+            check_interval = 1.0  # Check every second
+            next_check_time = start_time + check_interval
+            
+            while not request_completed[0] and time.time() - start_time < timeout:
+                time.sleep(0.1)
+                
+                # Log progress updates at regular intervals
+                if time.time() >= next_check_time:
+                    elapsed = time.time() - start_time
+                    logger.info(f"Still waiting for Gemini Image API response... ({elapsed:.1f}s elapsed)")
+                    next_check_time = time.time() + check_interval
+            
+            if not request_completed[0]:
+                logger.warning(f"Image generation request timed out after {timeout} seconds")
+                # Fall back to placeholder image
+                return self._generate_placeholder_image(image_description)
+            
+            if response_error[0]:
+                logger.error(f"Error in generate_image: {response_error[0]}")
+                # Fall back to placeholder image
+                return self._generate_placeholder_image(image_description)
+                
+            # Process the response
+            response = response_data[0]
+            
+            if not response or not response.candidates:
+                logger.warning("No candidates in image generation response")
+                return self._generate_placeholder_image(image_description)
+            
+            # Find image data in the response
+            for candidate in response.candidates:
+                if not candidate.content:
+                    continue
+                    
+                for part in candidate.content.parts:
+                    if hasattr(part, 'inline_data') and part.inline_data:
+                        logger.info("Found image data in response")
+                        
+                        try:
+                            # Extract image data
+                            if isinstance(part.inline_data.data, str):
+                                # Base64 encoded string
+                                image_data = base64.b64decode(part.inline_data.data)
+                            else:
+                                # Raw bytes
+                                image_data = part.inline_data.data
+                                
+                            # Generate a unique filename
+                            import uuid
+                            filename = f"generated_{uuid.uuid4().hex}.jpg"
+                            file_path = os.path.join(TEMP_IMG_DIR, filename)
+                            
+                            # Save the image to the temp directory
+                            with open(file_path, 'wb') as f:
+                                f.write(image_data)
+                            
+                            logger.info(f"Saved generated image to file: {file_path}")
+                            
+                            # Return the image URL and status
+                            return {
+                                "image_url": f"/static/temp/{filename}",
+                                "status": "success",
+                                "local_path": file_path
+                            }
+                        except Exception as e:
+                            logger.error(f"Error processing image data: {e}")
+                            break
+            
+            # If we couldn't extract image data, fall back to placeholder
+            logger.warning("Could not extract image data from response")
+            return self._generate_placeholder_image(image_description)
+            
+        except Exception as e:
+            logger.error(f"Error in image generation: {e}", exc_info=True)
+            return self._generate_placeholder_image(image_description)
+    
+    def _generate_placeholder_image(self, image_description):
+        """Generate a placeholder image when Gemini image generation fails."""
+        try:
+            logger.info("Falling back to placeholder image with custom styling")
             
             # Encode the description to create a custom placeholder image
             encoded_desc = image_description.replace(" ", "+")[:100]  # Limit to 100 chars
@@ -340,10 +506,10 @@ class RSSPostGenerator:
             return {
                 "image_url": image_url,
                 "status": "placeholder",  # Use "placeholder" instead of "error" for clearer messaging
-                "message": "Using placeholder image while actual image generation is being implemented."
+                "message": "Using placeholder image (image generation API unavailable)"
             }
         except Exception as e:
-            logger.error(f"Error in image generation fallback: {e}")
+            logger.error(f"Error in placeholder image generation: {e}")
             # Ultimate fallback if even our custom placeholder fails
             return {
                 "image_url": "https://via.placeholder.com/800x450/cccccc/333333?text=Image+Generation+Unavailable",
@@ -399,7 +565,7 @@ def generate_post():
         # Generate image using Gemini image model
         logger.info("Generating image...")
         image_result = generator.generate_image(image_description)
-        logger.info(f"Image result: {image_result}")
+        logger.info(f"Image result status: {image_result.get('status')}")
         
         response_data = {
             'title': title,
@@ -408,7 +574,8 @@ def generate_post():
             'image_url': image_result.get('image_url', ''),
             'status': image_result.get('status', 'error'),
             'processing': processing,  # Include processing flag in response
-            'message': image_result.get('message', '')
+            'message': image_result.get('message', ''),
+            'image_generation': 'AI-generated' if image_result.get('status') == 'success' else 'placeholder'
         }
         
         # If still processing, add a special status message
@@ -441,6 +608,31 @@ def test_api():
         'status': 'success',
         'message': 'API is working correctly'
     })
+
+@app.route('/api/check-image-model', methods=['GET'])
+def check_image_model():
+    """Check if the image generation model is available"""
+    try:
+        logger.info("Checking image generation model availability...")
+        # Get available models
+        models = client.list_models()
+        model_names = [model.name for model in models]
+        
+        # Check if our image generation model is in the list
+        image_model_available = any(IMAGE_GENERATION_MODEL in model_name for model_name in model_names)
+        
+        return jsonify({
+            'status': 'success',
+            'image_model_available': image_model_available,
+            'image_model_name': IMAGE_GENERATION_MODEL,
+            'available_models': model_names
+        })
+    except Exception as e:
+        logger.error(f"Error checking image model: {e}")
+        return jsonify({
+            'status': 'error',
+            'message': str(e)
+        }), 500
 
 if __name__ == '__main__':
     app.run(debug=True, port=5001)
