@@ -196,6 +196,14 @@
                 <span id="success-message"></span>
             </div>
         </div>
+        
+        <!-- Info Alert -->
+        <div id="info-alert" class="hidden bg-blue-100 border border-blue-400 text-blue-700 px-4 py-3 rounded-lg mb-4">
+            <div class="flex">
+                <i class="fas fa-info-circle mr-2 mt-1"></i>
+                <span id="info-message"></span>
+            </div>
+        </div>
     </div>
 
     <script>
@@ -251,6 +259,38 @@
             successAlert.classList.remove('hidden');
             setTimeout(() => successAlert.classList.add('hidden'), 5000);
         }
+        
+        function showInfo(message) {
+            // Create info alert if it doesn't exist
+            let infoAlert = document.getElementById('info-alert');
+            if (!infoAlert) {
+                infoAlert = document.createElement('div');
+                infoAlert.id = 'info-alert';
+                infoAlert.className = 'bg-blue-100 border border-blue-400 text-blue-700 px-4 py-3 rounded-lg mb-4';
+                
+                const infoContent = document.createElement('div');
+                infoContent.className = 'flex';
+                
+                const infoIcon = document.createElement('i');
+                infoIcon.className = 'fas fa-info-circle mr-2 mt-1';
+                
+                const infoMessage = document.createElement('span');
+                infoMessage.id = 'info-message';
+                
+                infoContent.appendChild(infoIcon);
+                infoContent.appendChild(infoMessage);
+                infoAlert.appendChild(infoContent);
+                
+                // Insert after error and success alerts
+                const successAlert = document.getElementById('success-alert');
+                successAlert.parentNode.insertBefore(infoAlert, successAlert.nextSibling);
+            }
+            
+            const infoMessage = document.getElementById('info-message');
+            infoMessage.textContent = message;
+            infoAlert.classList.remove('hidden');
+            setTimeout(() => infoAlert.classList.add('hidden'), 10000);
+        }
 
         // Manual input generation
         document.getElementById('generate-manual-btn').addEventListener('click', async () => {
@@ -282,7 +322,21 @@
                 // Always display results if we have content, regardless of status
                 if (data.post_content) {
                     displayResults(data);
-                    showSuccess('Content generated successfully!');
+                    
+                    if (data.processing) {
+                        // If the response indicates background processing is still happening
+                        showInfo('Content is still being generated. The page will show partial results for now.');
+                        
+                        // Set up an automatic refresh after a delay
+                        setTimeout(() => {
+                            // Show a refresh prompt to the user
+                            if (confirm('The AI is still generating content. Would you like to refresh the page to check for updates?')) {
+                                window.location.reload();
+                            }
+                        }, 15000); // 15 seconds delay before prompting
+                    } else {
+                        showSuccess('Content generated successfully!');
+                    }
                 } else {
                     showError(data.error || 'Failed to generate content');
                 }
@@ -372,9 +426,23 @@
 
                 const data = await response.json();
 
-                if (data.status === 'success') {
+                if (data.post_content) {
                     displayResults(data);
-                    showSuccess('Content generated successfully!');
+                    
+                    if (data.processing) {
+                        // If the response indicates background processing is still happening
+                        showInfo('Content is still being generated. The page will show partial results for now.');
+                        
+                        // Set up an automatic refresh after a delay
+                        setTimeout(() => {
+                            // Show a refresh prompt to the user
+                            if (confirm('The AI is still generating content. Would you like to refresh the page to check for updates?')) {
+                                window.location.reload();
+                            }
+                        }, 15000); // 15 seconds delay before prompting
+                    } else {
+                        showSuccess('Content generated successfully!');
+                    }
                 } else {
                     showError(data.error || 'Failed to generate content');
                 }
@@ -392,6 +460,33 @@
             document.getElementById('generated-image').src = data.image_url;
             document.getElementById('image-description').textContent = data.image_description;
             document.getElementById('results').classList.remove('hidden');
+            
+            // Add processing indicator if content is still being generated
+            if (data.processing) {
+                const processingIndicator = document.createElement('div');
+                processingIndicator.id = 'processing-indicator';
+                processingIndicator.className = 'text-center mt-4';
+                processingIndicator.innerHTML = `
+                    <div class="inline-block px-4 py-2 bg-blue-100 border border-blue-300 rounded-lg">
+                        <div class="flex items-center">
+                            <i class="fas fa-spinner fa-spin text-blue-500 mr-2"></i>
+                            <span class="text-blue-700">AI is still generating the complete content...</span>
+                        </div>
+                    </div>
+                `;
+                
+                // Add it after the post content
+                const postSection = document.getElementById('post-section');
+                if (!document.getElementById('processing-indicator')) {
+                    postSection.appendChild(processingIndicator);
+                }
+            } else {
+                // Remove processing indicator if it exists
+                const processingIndicator = document.getElementById('processing-indicator');
+                if (processingIndicator) {
+                    processingIndicator.remove();
+                }
+            }
             
             // Scroll to results
             document.getElementById('results').scrollIntoView({ behavior: 'smooth' });

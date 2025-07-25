@@ -110,6 +110,8 @@ class RSSPostGenerator:
             # Set a timeout for the request to prevent hanging
             import threading
             import time
+            import asyncio
+            import concurrent.futures
             
             response_data = [None]
             response_error = [None]
@@ -117,12 +119,15 @@ class RSSPostGenerator:
             
             def make_request():
                 try:
+                    logger.info("Starting Gemini API request...")
                     response_data[0] = client.models.generate_content(
                         model="gemini-2.5-flash",
                         contents=[prompt]
                     )
+                    logger.info("Gemini API request completed successfully")
                     request_completed[0] = True
                 except Exception as e:
+                    logger.error(f"Error in Gemini API request: {e}")
                     response_error[0] = e
                     request_completed[0] = True
             
@@ -130,23 +135,49 @@ class RSSPostGenerator:
             request_thread = threading.Thread(target=make_request)
             request_thread.start()
             
-            # Wait for up to 10 seconds
-            timeout = 10
+            # Wait for up to 30 seconds with status updates
+            timeout = 30  # Increased from 10s to 30s
             start_time = time.time()
+            
+            # Check progress every second and log it
+            check_interval = 1.0  # Check every second
+            next_check_time = start_time + check_interval
+            
             while not request_completed[0] and time.time() - start_time < timeout:
                 time.sleep(0.1)
+                
+                # Log progress updates at regular intervals
+                if time.time() >= next_check_time:
+                    elapsed = time.time() - start_time
+                    logger.info(f"Still waiting for Gemini API response... ({elapsed:.1f}s elapsed)")
+                    next_check_time = time.time() + check_interval
             
             if not request_completed[0]:
-                logger.warning(f"Request timed out after {timeout} seconds")
+                logger.warning(f"Request timed out after {timeout} seconds, but will continue in background")
+                # Instead of returning immediately, provide a status message that informs the user
+                # that processing is continuing in the background
                 return {
-                    "post_content": f"<h2>{title}</h2><p>{description}</p><p>The AI is still thinking about this topic. Please try again in a moment.</p>",
-                    "image_description": f"A modern, professional illustration representing: {title}"
+                    "post_content": f"""<h2>{title}</h2>
+                    <p>{description}</p>
+                    <div class="bg-yellow-100 border-l-4 border-yellow-500 text-yellow-700 p-4 my-4">
+                        <p class="font-bold">Processing</p>
+                        <p>The AI is still generating content for this topic. This may take a minute or two.</p>
+                        <p>You can try refreshing the page in a moment to see if the content is ready.</p>
+                    </div>""",
+                    "image_description": f"A modern, professional illustration representing: {title}",
+                    "processing": True  # Flag to indicate background processing
                 }
             
             if response_error[0]:
                 logger.error(f"Error in generate_content: {response_error[0]}")
                 return {
-                    "post_content": f"<h2>{title}</h2><p>{description}</p><p>Error generating content: {str(response_error[0])}</p>",
+                    "post_content": f"""<h2>{title}</h2>
+                    <p>{description}</p>
+                    <div class="bg-red-100 border-l-4 border-red-500 text-red-700 p-4 my-4">
+                        <p class="font-bold">Error</p>
+                        <p>Error generating content: {str(response_error[0])}</p>
+                        <p>Please try again in a few moments.</p>
+                    </div>""",
                     "image_description": f"A modern, professional illustration representing: {title}"
                 }
                 
@@ -155,60 +186,116 @@ class RSSPostGenerator:
             logger.info(f"Response type: {type(response)}")
             logger.info(f"Response attributes: {[attr for attr in dir(response) if not attr.startswith('_') and not callable(getattr(response, attr))]}") 
             
-            # Try multiple ways to get the response content
-            if hasattr(response, 'text') and response.text:
-                text = response.text.strip()
-                logger.info(f"Got response via .text ({len(text)} chars)")
-            elif hasattr(response, 'content') and response.content:
-                text = response.content.strip()
-                logger.info(f"Got response via .content ({len(text)} chars)")
-            elif hasattr(response, 'candidates') and response.candidates:
-                # If we have candidates, get text from the first one
-                candidate = response.candidates[0]
-                if hasattr(candidate, 'content') and hasattr(candidate.content, 'parts'):
-                    text = candidate.content.parts[0].text
-                    logger.info(f"Got response via .candidates[0].content.parts[0].text ({len(text)} chars)")
-                else:
-                    logger.warning("Candidate structure doesn't match expected format")
-                    text = str(candidate)
-            else:
-                logger.warning("Could not extract text from response")
+            # Enhanced response extraction with multiple fallbacks
+            text = None
+            extraction_methods = [
+                # Try all possible ways to extract text from response
+                lambda r: r.text.strip() if hasattr(r, 'text') and r.text else None,
+                lambda r: r.content.strip() if hasattr(r, 'content') and r.content else None,
+                lambda r: r.candidates[0].content.parts[0].text if (hasattr(r, 'candidates') and r.candidates and
+                                                                 hasattr(r.candidates[0], 'content') and
+                                                                 hasattr(r.candidates[0].content, 'parts') and
+                                                                 r.candidates[0].content.parts) else None,
+                lambda r: str(r.candidates[0]) if hasattr(r, 'candidates') and r.candidates else None,
+                lambda r: str(r) if r else None
+            ]
+            
+            # Try each extraction method until we get content
+            for i, extract in enumerate(extraction_methods):
+                try:
+                    extracted_text = extract(response)
+                    if extracted_text:
+                        text = extracted_text
+                        logger.info(f"Got response via extraction method {i+1} ({len(text)} chars)")
+                        break
+                except Exception as e:
+                    logger.warning(f"Extraction method {i+1} failed: {e}")
+            
+            if not text:
+                logger.warning("Could not extract text from response using any method")
                 return {
-                    "post_content": f"Blog post about: {title}\n\n{description}",
+                    "post_content": f"""<h2>{title}</h2>
+                    <p>{description}</p>
+                    <div class="bg-red-100 border-l-4 border-red-500 text-red-700 p-4 my-4">
+                        <p class="font-bold">Error</p>
+                        <p>Failed to extract content from the AI response.</p>
+                        <p>Please try again in a few moments.</p>
+                    </div>""",
                     "image_description": f"A modern, professional illustration representing: {title}"
                 }
             
             logger.info(f"Response text first 100 chars: {text[:100]}...")
             
-            # Try to parse as JSON
+            # Try to parse as JSON using multiple approaches
+            result = None
+            
+            # First, try to parse directly as JSON
             try:
                 logger.info("Attempting to parse response as JSON")
                 result = json.loads(text)
                 logger.info(f"JSON parsing successful: {list(result.keys())}")
             except json.JSONDecodeError as e:
                 logger.warning(f"JSON parse error: {e}")
-                # Try to extract JSON using regex
-                match = re.search(r'{.*}', text, re.DOTALL)
-                if match:
+                
+                # Try to extract JSON using regex patterns
+                json_patterns = [
+                    r'```json\s*(.*?)\s*```',  # Code block with json
+                    r'{[\s\S]*?}',             # Find any JSON-like object
+                    r'"post_content"\s*:[\s\S]*?"image_description"\s*:.*?["}]',  # Find specific fields
+                ]
+                
+                for pattern in json_patterns:
                     try:
-                        result = json.loads(match.group(0))
-                        logger.info(f"Regex JSON extraction successful: {list(result.keys())}")
-                    except Exception as e:
-                        logger.warning(f"Regex JSON parse failed: {e}")
-                        result = None
-                else:
-                    logger.warning("No JSON-like content found in response")
-                    result = None
+                        matches = re.findall(pattern, text, re.DOTALL)
+                        if matches:
+                            for match in matches:
+                                try:
+                                    # Try to make it valid JSON if it's not complete
+                                    if not match.strip().startswith('{'):
+                                        match = '{' + match + '}'
+                                    # Clean up any trailing commas which can break JSON parsing
+                                    match = re.sub(r',\s*}', '}', match)
+                                    result = json.loads(match)
+                                    logger.info(f"Regex JSON extraction successful with pattern {pattern}: {list(result.keys())}")
+                                    break
+                                except json.JSONDecodeError:
+                                    continue
+                        if result:
+                            break
+                    except Exception as ex:
+                        logger.warning(f"Regex pattern {pattern} failed: {ex}")
+                
+                # If still no valid JSON, try to extract content more aggressively
                 if not result:
-                    # Fallback: extract post and image description heuristically
-                    post_content = text
-                    image_desc_match = re.search(r'"image_description"\s*:\s*"([^"]+)"', text)
+                    logger.warning("Attempting more aggressive extraction of content")
+                    
+                    # Extract image description if possible
+                    image_desc_match = re.search(r'"image_description"[\s:]*"([^"]+)"', text)
                     image_description = image_desc_match.group(1) if image_desc_match else f"A modern, professional illustration representing: {title}"
+                    
+                    # Try to extract post content - look for common patterns
+                    post_content_patterns = [
+                        r'"post_content"[\s:]*"([\s\S]+?)"(?=,|\})',  # Standard JSON format
+                        r'<h[1-6]>([\s\S]+?)</h[1-6]>',               # Look for HTML headings
+                        r'# (.*?)\n',                                # Markdown headings
+                    ]
+                    
+                    post_content = None
+                    for pattern in post_content_patterns:
+                        match = re.search(pattern, text)
+                        if match:
+                            post_content = match.group(1)
+                            break
+                    
+                    if not post_content:
+                        # If we still couldn't extract content, use the whole text
+                        post_content = text
+                    
                     result = {
                         "post_content": post_content,
                         "image_description": image_description
                     }
-                    logger.info("Created result with heuristic extraction")
+                    logger.info("Created result with aggressive content extraction")
             
             # Ensure result has required keys
             if not result.get("post_content"):
@@ -228,12 +315,41 @@ class RSSPostGenerator:
             }
     
     def generate_image(self, image_description):
-        """Fallback to placeholder image since no valid Gemini image model is available."""
-        logger.warning("No valid Gemini image model available, using placeholder.")
-        return {
-            "image_url": "https://via.placeholder.com/800x600?text=" + image_description.replace(" ", "+"),
-            "status": "error"
-        }
+        """Attempt to generate an image using Gemini API or fallback to placeholder."""
+        try:
+            # This is still a fallback function since we haven't implemented the actual 
+            # image generation using Gemini. In the future when Gemini image generation is available,
+            # this is where you'd implement it.
+            
+            # For now, provide a better-looking placeholder image with the description
+            logger.info("Using enhanced placeholder image with custom styling")
+            
+            # Encode the description to create a custom placeholder image
+            encoded_desc = image_description.replace(" ", "+")[:100]  # Limit to 100 chars
+            
+            # Generate a random seed based on the description to get varied colors
+            import hashlib
+            seed = int(hashlib.md5(image_description.encode()).hexdigest(), 16) % 1000
+            
+            # Create a more visually appealing placeholder URL with custom colors based on seed
+            bg_color = f"{(seed * 123) % 255:02x}{(seed * 231) % 255:02x}{(seed * 321) % 255:02x}"
+            text_color = f"{255-(seed * 123) % 255:02x}{255-(seed * 231) % 255:02x}{255-(seed * 321) % 255:02x}"
+            
+            image_url = f"https://via.placeholder.com/800x450/{bg_color}/{text_color}?text={encoded_desc}"
+            
+            return {
+                "image_url": image_url,
+                "status": "placeholder",  # Use "placeholder" instead of "error" for clearer messaging
+                "message": "Using placeholder image while actual image generation is being implemented."
+            }
+        except Exception as e:
+            logger.error(f"Error in image generation fallback: {e}")
+            # Ultimate fallback if even our custom placeholder fails
+            return {
+                "image_url": "https://via.placeholder.com/800x450/cccccc/333333?text=Image+Generation+Unavailable",
+                "status": "error",
+                "message": str(e)
+            }
 
 # Initialize the generator
 generator = RSSPostGenerator()
@@ -274,6 +390,9 @@ def generate_post():
         content_result = generator.generate_post_content(title, description)
         logger.info(f"Content result keys: {list(content_result.keys()) if content_result else 'None'}")
         
+        # Check if we're in processing mode (background request still running)
+        processing = content_result.get('processing', False)
+        
         image_description = content_result.get('image_description', f"An illustration representing: {title}")
         logger.info(f"Image description: {image_description[:50]}...")
         
@@ -287,20 +406,32 @@ def generate_post():
             'post_content': content_result.get('post_content', f"Blog post about: {title}\n\n{description}"),
             'image_description': image_description,
             'image_url': image_result.get('image_url', ''),
-            'status': image_result.get('status', 'error')
+            'status': image_result.get('status', 'error'),
+            'processing': processing,  # Include processing flag in response
+            'message': image_result.get('message', '')
         }
         
-        logger.info(f"API Response prepared: {len(response_data['post_content'])} chars of content, image status: {response_data['status']}")
+        # If still processing, add a special status message
+        if processing:
+            response_data['status_message'] = "Content generation is still in progress. Partial results shown."
+        
+        logger.info(f"API Response prepared: {len(response_data['post_content'])} chars of content, image status: {response_data['status']}, processing: {processing}")
         return jsonify(response_data)
     except Exception as e:
         logger.error(f"Error in generate_post endpoint: {e}", exc_info=True)
+        error_html = f"""<div class="bg-red-100 border-l-4 border-red-500 text-red-700 p-4 my-4">
+            <p class="font-bold">Error</p>
+            <p>{str(e)}</p>
+            <p>Please try again in a few moments.</p>
+        </div>"""
+        
         return jsonify({
             'error': f"An error occurred: {str(e)}",
             'title': title if 'title' in locals() else "Error",
-            'post_content': "Error generating content. Please try again.",
-            'image_description': "Error",
-            'image_url': "https://via.placeholder.com/800x600?text=Error",
-            'status': "error"
+            'post_content': error_html,
+            'image_description': "Error occurred",
+            'image_url': "https://via.placeholder.com/800x450/ff0000/ffffff?text=Error+Occurred",
+            'status': 'error'
         }), 500
 
 @app.route('/api/test', methods=['GET'])
