@@ -152,9 +152,20 @@
                 <div id="image-section" class="mb-8">
                     <h4 class="text-lg font-semibold text-gray-800 mb-4">Featured Image</h4>
                     <div class="relative">
+                        <div id="image-loading" class="absolute inset-0 flex items-center justify-center bg-gray-200 bg-opacity-70 rounded-lg hidden">
+                            <div class="text-center">
+                                <i class="fas fa-spinner fa-spin text-purple-600 text-3xl mb-2"></i>
+                                <p class="text-gray-700">Generating image...</p>
+                            </div>
+                        </div>
                         <img id="generated-image" src="" alt="Generated image" 
-                             class="w-full max-w-2xl mx-auto rounded-lg shadow-lg">
+                             class="w-full max-w-2xl mx-auto rounded-lg shadow-lg"
+                             onerror="this.onerror=null; this.src='https://via.placeholder.com/1200x628/cccccc/333333?text=Image+Loading+Failed'; document.getElementById('image-error').classList.remove('hidden');">
+                        <div id="image-error" class="mt-2 text-sm text-red-600 hidden">
+                            Failed to load image. Using placeholder instead.
+                        </div>
                         <div id="image-description" class="mt-2 text-sm text-gray-600 italic"></div>
+                        <div id="image-source" class="text-xs text-gray-500 mt-1"></div>
                     </div>
                 </div>
 
@@ -481,23 +492,52 @@
                     `<p class="text-red-500">Error: Could not display content in expected format.</p>`;
             }
             
-            // Set the image
-            document.getElementById('generated-image').src = data.image_url;
+            // Show image loading indicator
+            document.getElementById('image-loading').classList.remove('hidden');
+            
+            // Reset any previous error state
+            document.getElementById('image-error').classList.add('hidden');
+            
+            // Create image object to preload
+            const img = new Image();
+            img.onload = function() {
+                // Hide loading indicator when image loads
+                document.getElementById('image-loading').classList.add('hidden');
+                // Set the image source on the visible element now that it's loaded
+                document.getElementById('generated-image').src = data.image_url;
+            };
+            img.onerror = function() {
+                // Hide loading indicator and show error
+                document.getElementById('image-loading').classList.add('hidden');
+                document.getElementById('image-error').classList.remove('hidden');
+                // Use a placeholder image
+                document.getElementById('generated-image').src = 'https://via.placeholder.com/1200x628/cccccc/333333?text=Image+Loading+Failed';
+            };
+            // Start loading the image
+            img.src = data.image_url;
+            
+            // Set image description
             document.getElementById('image-description').textContent = data.image_description;
             
             // Show image source information
-            const imageStatus = document.createElement('div');
-            imageStatus.className = 'text-xs text-gray-500 mt-1';
-            imageStatus.textContent = data.image_generation === 'AI-generated' ? 
-                'AI-generated image' : 'Stock image from Unsplash';
+            const imageSourceElement = document.getElementById('image-source');
+            let sourceText = "Placeholder image";
             
-            const imgDescriptionEl = document.getElementById('image-description');
-            // Remove any existing status element
-            const existingStatus = imgDescriptionEl.nextElementSibling;
-            if (existingStatus && existingStatus.classList.contains('text-xs')) {
-                existingStatus.remove();
+            if (data.status === 'success') {
+                if (data.source === 'unsplash') {
+                    sourceText = "Image from Unsplash based on description";
+                } else if (data.source === 'pexels') {
+                    sourceText = "Stock image from Pexels";
+                } else if (data.source === 'picsum') {
+                    sourceText = "Random image from Picsum Photos";
+                } else if (data.source === 'gemini') {
+                    sourceText = "AI-generated image from Google Gemini";
+                }
+            } else if (data.status === 'placeholder') {
+                sourceText = "Placeholder image (image services unavailable)";
             }
-            imgDescriptionEl.parentNode.insertBefore(imageStatus, imgDescriptionEl.nextSibling);
+            
+            imageSourceElement.textContent = sourceText;
             
             // Show results section
             document.getElementById('results').classList.remove('hidden');
@@ -546,13 +586,37 @@
             });
         });
 
-        // Download image (placeholder functionality)
-        document.getElementById('download-image-btn').addEventListener('click', () => {
+        // Download image
+        document.getElementById('download-image-btn').addEventListener('click', async () => {
             const imageUrl = document.getElementById('generated-image').src;
-            const link = document.createElement('a');
-            link.href = imageUrl;
-            link.download = 'generated-image.jpg';
-            link.click();
+            
+            try {
+                // For local images or remote images that allow CORS
+                const response = await fetch(imageUrl);
+                const blob = await response.blob();
+                const objectURL = URL.createObjectURL(blob);
+                
+                const link = document.createElement('a');
+                link.href = objectURL;
+                link.download = 'generated-image.jpg';
+                link.click();
+                
+                // Clean up the object URL
+                setTimeout(() => URL.revokeObjectURL(objectURL), 4000);
+                showSuccess('Image downloaded successfully!');
+            } catch (error) {
+                console.error('Download error:', error);
+                
+                // Fallback for remote images with CORS restrictions
+                const link = document.createElement('a');
+                link.href = imageUrl;
+                link.target = '_blank';
+                link.rel = 'noopener noreferrer';
+                link.download = 'generated-image.jpg';
+                link.click();
+                
+                showInfo('Opening image in new tab. Right-click and select "Save image as..." to download.');
+            }
         });
     </script>
 </body>

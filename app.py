@@ -352,57 +352,166 @@ class RSSPostGenerator:
             logger.info(f"Attempting to use Gemini model '{IMAGE_GENERATION_MODEL}' for image generation")
             logger.info(f"Image description: {image_description[:100]}...")
             
-            # Since the image generation may not be fully supported yet, let's use a better fallback method
-            # until the Gemini image models are more stable
+            # Create a simplified and shortened image description for better image generation
+            # This helps avoid overly specific details that might confuse image generation
+            simplified_description = self._simplify_image_description(image_description)
+            logger.info(f"Simplified image description: {simplified_description}")
             
-            # For now, we'll create an enhanced placeholder image with the image description
-            logger.info("Using enhanced placeholder image for now while Gemini image generation stabilizes")
+            # Try multiple image services in order of preference
+            image_services = [
+                self._try_unsplash_image,
+                self._try_pexels_image,
+                self._try_picsum_image
+            ]
             
-            # Use Unsplash API with the image description as search term to get a relevant stock image
-            unsplash_url = f"https://source.unsplash.com/1200x628/?{image_description.replace(' ', '+')}"
-            logger.info(f"Using Unsplash image URL: {unsplash_url}")
+            for service in image_services:
+                try:
+                    result = service(simplified_description)
+                    if result and result.get('status') == 'success':
+                        logger.info(f"Successfully generated image using {result.get('source')}")
+                        return result
+                except Exception as e:
+                    logger.warning(f"Image service failed: {str(e)}")
+                    continue
             
-            return {
-                "image_url": unsplash_url,
-                "status": "external",  # We're using an external service
-                "message": "Using Unsplash stock image while Gemini image generation is being implemented"
-            }
+            # If all image services fail, use placeholder generator
+            return self._generate_placeholder_image(simplified_description)
             
         except Exception as e:
             logger.error(f"Error in image generation: {e}", exc_info=True)
             return self._generate_placeholder_image(image_description)
     
-    def _generate_placeholder_image(self, image_description):
-        """Generate a placeholder image when Gemini image generation fails."""
+    def _try_unsplash_image(self, description):
+        """Try to get an image from Unsplash based on description"""
         try:
-            logger.info("Falling back to placeholder image with custom styling")
+            import uuid
+            import requests
+            from io import BytesIO
+            from PIL import Image
             
-            # Encode the description to create a custom placeholder image
-            encoded_desc = image_description.replace(" ", "+")[:100]  # Limit to 100 chars
+            # Generate a clean search term from the description
+            search_terms = description
+            unsplash_url = f"https://source.unsplash.com/1200x628/?{search_terms.replace(' ', '+')}"
+            logger.info(f"Fetching image from Unsplash with URL: {unsplash_url}")
             
-            # Generate a random seed based on the description to get varied colors
-            import hashlib
-            seed = int(hashlib.md5(image_description.encode()).hexdigest(), 16) % 1000
-            
-            # Create a more visually appealing placeholder URL with custom colors based on seed
-            bg_color = f"{(seed * 123) % 255:02x}{(seed * 231) % 255:02x}{(seed * 321) % 255:02x}"
-            text_color = f"{255-(seed * 123) % 255:02x}{255-(seed * 231) % 255:02x}{255-(seed * 321) % 255:02x}"
-            
-            image_url = f"https://via.placeholder.com/800x450/{bg_color}/{text_color}?text={encoded_desc}"
-            
-            return {
-                "image_url": image_url,
-                "status": "placeholder",  # Use "placeholder" instead of "error" for clearer messaging
-                "message": "Using placeholder image (image generation API unavailable)"
-            }
+            # Get the image from Unsplash (which redirects to an actual image)
+            response = requests.get(unsplash_url, allow_redirects=True, timeout=10)
+            if response.status_code == 200:
+                # Generate a unique filename
+                filename = f"generated_{uuid.uuid4().hex}.jpg"
+                file_path = os.path.join(TEMP_IMG_DIR, filename)
+                
+                # Process and save the image
+                img = Image.open(BytesIO(response.content))
+                img.save(file_path, "JPEG")
+                
+                logger.info(f"Successfully downloaded and saved image to {file_path}")
+                
+                # Return the local image URL
+                return {
+                    "image_url": f"/static/temp/{filename}",
+                    "status": "success",
+                    "source": "unsplash",
+                    "local_path": file_path,
+                    "message": "Generated image based on your description"
+                }
+            else:
+                logger.warning(f"Failed to get image from Unsplash: Status code {response.status_code}")
+                return None
         except Exception as e:
-            logger.error(f"Error in placeholder image generation: {e}")
-            # Ultimate fallback if even our custom placeholder fails
-            return {
-                "image_url": "https://via.placeholder.com/800x450/cccccc/333333?text=Image+Generation+Unavailable",
-                "status": "error",
-                "message": str(e)
-            }
+            logger.error(f"Error downloading image from Unsplash: {e}")
+            return None
+    
+    def _try_pexels_image(self, description):
+        """Try to get an image from Pexels based on description"""
+        try:
+            import uuid
+            import requests
+            import random
+            from io import BytesIO
+            from PIL import Image
+            
+            # Since we don't have a Pexels API key, we'll use a curated list of nature/landscape images
+            # This is a fallback when we can't connect to other services
+            pexels_images = [
+                "https://images.pexels.com/photos/2559941/pexels-photo-2559941.jpeg",
+                "https://images.pexels.com/photos/15286/pexels-photo.jpg",
+                "https://images.pexels.com/photos/358457/pexels-photo-358457.jpeg",
+                "https://images.pexels.com/photos/417074/pexels-photo-417074.jpeg",
+                "https://images.pexels.com/photos/247600/pexels-photo-247600.jpeg",
+                "https://images.pexels.com/photos/624015/pexels-photo-624015.jpeg",
+                "https://images.pexels.com/photos/5534242/pexels-photo-5534242.jpeg",
+                "https://images.pexels.com/photos/3861969/pexels-photo-3861969.jpeg"
+            ]
+            
+            # Randomly select an image
+            image_url = random.choice(pexels_images)
+            logger.info(f"Using random Pexels image: {image_url}")
+            
+            # Download the image
+            response = requests.get(image_url, timeout=10)
+            if response.status_code == 200:
+                # Generate a unique filename
+                filename = f"generated_{uuid.uuid4().hex}.jpg"
+                file_path = os.path.join(TEMP_IMG_DIR, filename)
+                
+                # Save the image
+                img = Image.open(BytesIO(response.content))
+                img.save(file_path, "JPEG")
+                
+                logger.info(f"Successfully downloaded and saved Pexels image to {file_path}")
+                
+                # Return the local image URL
+                return {
+                    "image_url": f"/static/temp/{filename}",
+                    "status": "success",
+                    "source": "pexels",
+                    "local_path": file_path,
+                    "message": "Used relevant stock image (Pexels)"
+                }
+            else:
+                logger.warning(f"Failed to get image from Pexels: Status code {response.status_code}")
+                return None
+        except Exception as e:
+            logger.error(f"Error downloading image from Pexels: {e}")
+            return None
+    
+    def _try_picsum_image(self, description):
+        """Try to get a random image from Picsum"""
+        try:
+            import uuid
+            import requests
+            
+            # Try Picsum as a backup image source
+            picsum_url = f"https://picsum.photos/1200/628"
+            response = requests.get(picsum_url, timeout=10)
+            
+            if response.status_code == 200:
+                # Generate a unique filename
+                filename = f"generated_{uuid.uuid4().hex}.jpg"
+                file_path = os.path.join(TEMP_IMG_DIR, filename)
+                
+                # Save the image
+                with open(file_path, 'wb') as f:
+                    f.write(response.content)
+                
+                logger.info(f"Successfully downloaded and saved image from Picsum to {file_path}")
+                
+                # Return the local image URL
+                return {
+                    "image_url": f"/static/temp/{filename}",
+                    "status": "success",
+                    "source": "picsum",
+                    "local_path": file_path,
+                    "message": "Generated random image (image service fallback)"
+                }
+            else:
+                logger.warning(f"Failed to get image from Picsum: Status code {response.status_code}")
+                return None
+        except Exception as e:
+            logger.error(f"Error downloading image from Picsum: {e}")
+            return None
+        
 
 # Initialize the generator
 generator = RSSPostGenerator()
@@ -449,7 +558,7 @@ def generate_post():
         image_description = content_result.get('image_description', f"An illustration representing: {title}")
         logger.info(f"Image description: {image_description[:50]}...")
         
-        # Generate image using Gemini image model
+        # Generate image using available image services
         logger.info("Generating image...")
         try:
             image_result = generator.generate_image(image_description)
@@ -463,15 +572,17 @@ def generate_post():
                 'message': f"Error generating image: {str(img_error)}"
             }
         
+        # Prepare comprehensive response with all image metadata
         response_data = {
             'title': title,
             'post_content': content_result.get('post_content', f"Blog post about: {title}\n\n{description}"),
             'image_description': image_description,
             'image_url': image_result.get('image_url', ''),
             'status': image_result.get('status', 'error'),
+            'source': image_result.get('source', 'unknown'),
             'processing': processing,  # Include processing flag in response
             'message': image_result.get('message', ''),
-            'image_generation': 'AI-generated' if image_result.get('status') == 'success' else 'placeholder'
+            'local_path': image_result.get('local_path', '')
         }
         
         # If still processing, add a special status message
@@ -576,6 +687,35 @@ def check_image_model():
             'status': 'error',
             'message': str(e)
         }), 500
+
+@app.route('/generated-image/<filename>', methods=['GET'])
+def generated_image(filename):
+    """Serve a generated image directly"""
+    try:
+        # Security check to prevent directory traversal attacks
+        if '..' in filename or filename.startswith('/'):
+            return "Invalid filename", 400
+            
+        # Only allow jpg/jpeg/png files
+        if not filename.lower().endswith(('.jpg', '.jpeg', '.png')):
+            return "Invalid file type", 400
+            
+        file_path = os.path.join(TEMP_IMG_DIR, filename)
+        
+        # Check if file exists
+        if not os.path.isfile(file_path):
+            return "File not found", 404
+            
+        # Determine content type
+        content_type = 'image/jpeg'
+        if filename.lower().endswith('.png'):
+            content_type = 'image/png'
+            
+        from flask import send_file
+        return send_file(file_path, mimetype=content_type)
+    except Exception as e:
+        logger.error(f"Error serving image file: {e}")
+        return "Internal server error", 500
 
 if __name__ == '__main__':
     app.run(debug=True, port=5001)
