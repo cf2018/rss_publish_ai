@@ -162,10 +162,13 @@
                              class="w-full max-w-2xl mx-auto rounded-lg shadow-lg"
                              onerror="this.onerror=null; this.src='https://via.placeholder.com/1200x628/cccccc/333333?text=Image+Loading+Failed'; document.getElementById('image-error').classList.remove('hidden');">
                         <div id="image-error" class="mt-2 text-sm text-red-600 hidden">
-                            Failed to load image. Using placeholder instead.
+                            Failed to load image. Using placeholder instead. 
+                            <button id="retry-image-btn" class="ml-2 text-blue-600 underline">Retry</button>
                         </div>
                         <div id="image-description" class="mt-2 text-sm text-gray-600 italic"></div>
                         <div id="image-source" class="text-xs text-gray-500 mt-1"></div>
+                        <!-- Image debug info -->
+                        <div id="image-debug-info" class="text-xs text-gray-400 mt-1 p-1 rounded-sm hidden"></div>
                     </div>
                 </div>
 
@@ -497,24 +500,176 @@
             
             // Reset any previous error state
             document.getElementById('image-error').classList.add('hidden');
+            document.getElementById('image-debug-info').classList.add('hidden');
             
-            // Create image object to preload
-            const img = new Image();
-            img.onload = function() {
-                // Hide loading indicator when image loads
-                document.getElementById('image-loading').classList.add('hidden');
-                // Set the image source on the visible element now that it's loaded
-                document.getElementById('generated-image').src = data.image_url;
-            };
-            img.onerror = function() {
+            // Store original URL for retries
+            const imageUrl = data.image_url;
+            document.getElementById('generated-image').setAttribute('data-original-url', imageUrl);
+            
+            // Track image load attempts
+            let imageAttempts = 0;
+            const maxAttempts = 3;
+            
+            // Validate image URL - if it starts with /static/temp/, check if it exists first
+            let isLocalImage = false;
+            
+            if (imageUrl.startsWith('/static/temp/')) {
+                isLocalImage = true;
+                const filename = imageUrl.split('/').pop();
+                
+                // First check if the image is valid
+                console.log(`Checking validity of local image: ${filename}`);
+                
+                // Try to validate the local image via API
+                fetch(`/api/check-image/${filename}`)
+                    .then(response => response.json())
+                    .then(validationData => {
+                        if (validationData.valid) {
+                            console.log(`Image validated successfully: ${filename}`);
+                            
+                            // Show image debug info
+                            const debugInfo = document.getElementById('image-debug-info');
+                            debugInfo.innerHTML = `
+                                <div class="text-xs text-gray-500 mt-2">
+                                    <div><strong>Format:</strong> ${validationData.format || 'Unknown'}</div>
+                                    <div><strong>Dimensions:</strong> ${validationData.dimensions || 'Unknown'}</div>
+                                    <div><strong>Size:</strong> ${Math.round(validationData.size/1024) || '?'} KB</div>
+                                </div>
+                            `;
+                            debugInfo.classList.remove('hidden');
+                            
+                            // Use the direct path from the validation response if available
+                            const urlToLoad = validationData.direct_path || imageUrl;
+                            console.log(`Loading validated image from: ${urlToLoad}`);
+                            loadValidatedImage(urlToLoad);
+                        } else {
+                            console.error(`Image validation failed: ${validationData.error || 'Unknown error'}`);
+                            
+                            // Show image debug info with error
+                            const debugInfo = document.getElementById('image-debug-info');
+                            debugInfo.innerHTML = `
+                                <div class="text-xs text-red-500 mt-2">
+                                    <div><strong>Error:</strong> ${validationData.error || 'Unknown error'}</div>
+                                    <div><strong>Filename:</strong> ${validationData.filename || filename}</div>
+                                </div>
+                            `;
+                            debugInfo.classList.remove('hidden');
+                            
+                            handleInvalidImage();
+                        }
+                    })
+                    .catch(err => {
+                        console.error(`Error validating image: ${err}`);
+                        handleInvalidImage();
+                    });
+            } else {
+                // For external images, just try to load directly
+                loadValidatedImage(imageUrl);
+            }
+            
+            function loadValidatedImage(url) {
+                imageAttempts++;
+                console.log(`Attempt ${imageAttempts} to load image: ${url}`);
+                
+                // Create image object to preload
+                const img = new Image();
+                
+                // Add a timeout for slow loading images
+                const imageTimeout = setTimeout(() => {
+                    console.error(`Image load timeout: ${url}`);
+                    if (!img.complete) {
+                        handleImageLoadError();
+                    }
+                }, 10000); // 10 second timeout
+                
+                img.onload = function() {
+                    clearTimeout(imageTimeout);
+                    document.getElementById('image-loading').classList.add('hidden');
+                    document.getElementById('generated-image').src = url;
+                    document.getElementById('generated-image').classList.remove('hidden');
+                    console.log(`Image loaded successfully: ${url}`);
+                };
+                
+                img.onerror = function() {
+                    clearTimeout(imageTimeout);
+                    console.error(`Failed to load image: ${url}`);
+                    handleImageLoadError();
+                };
+                
+                // Start loading the image
+                img.src = url;
+                
+                function handleImageLoadError() {
+                    if (imageAttempts < maxAttempts) {
+                        // Try with cache buster
+                        const cacheBuster = `?cb=${new Date().getTime()}`;
+                        const newUrl = url.includes('?') ? 
+                            url.replace(/\?/, `${cacheBuster}&`) : 
+                            url + cacheBuster;
+                        
+                        console.log(`Retrying with cache buster: ${newUrl}`);
+                        loadValidatedImage(newUrl);
+                    } else {
+                        handleInvalidImage();
+                    }
+                }
+            }
+            
+            function handleInvalidImage() {
                 // Hide loading indicator and show error
                 document.getElementById('image-loading').classList.add('hidden');
+                document.getElementById('generated-image').classList.add('hidden');
                 document.getElementById('image-error').classList.remove('hidden');
-                // Use a placeholder image
-                document.getElementById('generated-image').src = 'https://via.placeholder.com/1200x628/cccccc/333333?text=Image+Loading+Failed';
-            };
-            // Start loading the image
-            img.src = data.image_url;
+                
+                // Try a direct path if this is a local image
+                if (isLocalImage) {
+                    const filename = imageUrl.split('/').pop();
+                    const directPath = `/generated-image/${filename}`;
+                    
+                    console.log(`Trying alternative direct path: ${directPath}`);
+                    document.getElementById('generated-image').src = directPath;
+                    document.getElementById('generated-image').classList.remove('hidden');
+                    
+                    // Add a retry button inside error message
+                    const retryBtn = document.createElement('button');
+                    retryBtn.id = 'retry-image-btn';
+                    retryBtn.className = 'bg-blue-500 hover:bg-blue-700 text-white font-bold py-1 px-3 rounded text-sm mt-2';
+                    retryBtn.innerHTML = '<i class="fas fa-sync-alt mr-1"></i> Retry Loading Image';
+                    
+                    const errorMsg = document.getElementById('image-error');
+                    // Clear previous retry buttons if any
+                    const oldBtn = errorMsg.querySelector('button');
+                    if (oldBtn) oldBtn.remove();
+                    
+                    errorMsg.appendChild(retryBtn);
+                    
+                    // Update debug info if we have extra details
+                    const debugInfo = document.getElementById('image-debug-info');
+                    if (debugInfo.innerHTML === '') {
+                        debugInfo.innerHTML = `
+                            <div class="text-xs text-red-500 mt-2">
+                                <div><strong>Error:</strong> Failed to load image</div>
+                                <div><strong>Path:</strong> ${imageUrl}</div>
+                                <div><strong>Alternate Path:</strong> ${directPath}</div>
+                            </div>
+                        `;
+                        debugInfo.classList.remove('hidden');
+                    }
+                } else {
+                    // Use a placeholder image for external image failures
+                    document.getElementById('generated-image').src = 'https://via.placeholder.com/800x450/ff6b6b/ffffff?text=Image+Loading+Failed';
+                    document.getElementById('generated-image').classList.remove('hidden');
+                    
+                    // Add a retry button
+                    const retryBtn = document.createElement('button');
+                    retryBtn.id = 'retry-image-btn';
+                    retryBtn.className = 'bg-blue-500 hover:bg-blue-700 text-white font-bold py-1 px-3 rounded text-sm mt-2';
+                    retryBtn.innerHTML = '<i class="fas fa-sync-alt mr-1"></i> Retry Loading Image';
+                    
+                    const errorMsg = document.getElementById('image-error');
+                    errorMsg.appendChild(retryBtn);
+                }
+            }
             
             // Set image description
             document.getElementById('image-description').textContent = data.image_description;
@@ -616,6 +771,163 @@
                 link.click();
                 
                 showInfo('Opening image in new tab. Right-click and select "Save image as..." to download.');
+            }
+        });
+
+        // Add retry functionality for image loading
+        document.addEventListener('click', function(event) {
+            if (event.target && (event.target.id === 'retry-image-btn' || event.target.closest('#retry-image-btn'))) {
+                console.log('Retrying image load...');
+                
+                // Get the original URL or current image URL
+                let imageUrl = document.getElementById('generated-image').getAttribute('data-original-url');
+                if (!imageUrl) {
+                    imageUrl = document.getElementById('generated-image').src;
+                }
+                
+                if (imageUrl) {
+                    // Show loading indicator and hide error
+                    document.getElementById('image-loading').classList.remove('hidden');
+                    document.getElementById('image-error').classList.add('hidden');
+                    document.getElementById('generated-image').classList.add('hidden');
+                    
+                    // Try multiple approaches in sequence
+                    
+                    // 1. First try with cache buster
+                    const cacheBuster = '?cb=' + new Date().getTime();
+                    const newUrl = imageUrl.includes('?') ? 
+                        imageUrl.replace(/\?/, `${cacheBuster}&`) : 
+                        imageUrl + cacheBuster;
+                    
+                    console.log(`Retrying with cache buster URL: ${newUrl}`);
+                    
+                    // 2. If it's a local image, try both paths
+                    if (imageUrl.startsWith('/static/temp/') || imageUrl.includes('/generated-image/')) {
+                        const filename = imageUrl.split('/').pop().split('?')[0]; // Remove any query params
+                        
+                        // Check again if the image is valid
+                        fetch(`/api/check-image/${filename}`)
+                            .then(response => response.json())
+                            .then(data => {
+                                if (data.valid) {
+                                    // Update debug info with latest details
+                                    const debugInfo = document.getElementById('image-debug-info');
+                                    debugInfo.innerHTML = `
+                                        <div class="text-xs text-gray-500 mt-2">
+                                            <div><strong>Format:</strong> ${data.format || 'Unknown'}</div>
+                                            <div><strong>Dimensions:</strong> ${data.dimensions || 'Unknown'}</div>
+                                            <div><strong>Size:</strong> ${Math.round(data.size/1024) || '?'} KB</div>
+                                        </div>
+                                    `;
+                                    debugInfo.classList.remove('hidden');
+                                    
+                                    // Use the direct path
+                                    const alternateUrl = data.direct_path || `/generated-image/${filename}`;
+                                    console.log(`Using validated image path: ${alternateUrl}`);
+                                    
+                                    // Load the image
+                                    const img = new Image();
+                                    img.onload = function() {
+                                        document.getElementById('image-loading').classList.add('hidden');
+                                        document.getElementById('generated-image').src = alternateUrl;
+                                        document.getElementById('generated-image').classList.remove('hidden');
+                                    };
+                                    img.onerror = function() {
+                                        // If direct path fails, try static path with cache buster
+                                        const staticUrl = `/static/temp/${filename}${cacheBuster}`;
+                                        console.log(`Direct path failed, trying static path: ${staticUrl}`);
+                                        
+                                        const fallbackImg = new Image();
+                                        fallbackImg.onload = function() {
+                                            document.getElementById('image-loading').classList.add('hidden');
+                                            document.getElementById('generated-image').src = staticUrl;
+                                            document.getElementById('generated-image').classList.remove('hidden');
+                                        };
+                                        fallbackImg.onerror = function() {
+                                            // If all fails, show error
+                                            document.getElementById('image-loading').classList.add('hidden');
+                                            document.getElementById('image-error').classList.remove('hidden');
+                                            document.getElementById('generated-image').src = 'https://via.placeholder.com/800x450/ff6b6b/ffffff?text=Image+Retry+Failed';
+                                            document.getElementById('generated-image').classList.remove('hidden');
+                                        };
+                                        fallbackImg.src = staticUrl;
+                                    };
+                                    img.src = alternateUrl;
+                                    
+                                } else {
+                                    // If validation fails, try both paths anyway
+                                    console.log(`Image validation failed: ${data.error}, trying both paths...`);
+                                    
+                                    // Update debug info with error
+                                    const debugInfo = document.getElementById('image-debug-info');
+                                    debugInfo.innerHTML = `
+                                        <div class="text-xs text-red-500 mt-2">
+                                            <div><strong>Error:</strong> ${data.error || 'Validation failed'}</div>
+                                            <div><strong>Attempting:</strong> Multiple paths</div>
+                                        </div>
+                                    `;
+                                    debugInfo.classList.remove('hidden');
+                                    
+                                    // Try direct path first
+                                    const directUrl = `/generated-image/${filename}`;
+                                    const staticUrl = `/static/temp/${filename}${cacheBuster}`;
+                                    
+                                    const img = new Image();
+                                    img.onload = function() {
+                                        document.getElementById('image-loading').classList.add('hidden');
+                                        document.getElementById('generated-image').src = directUrl;
+                                        document.getElementById('generated-image').classList.remove('hidden');
+                                    };
+                                    img.onerror = function() {
+                                        // If direct path fails, try static path
+                                        const fallbackImg = new Image();
+                                        fallbackImg.onload = function() {
+                                            document.getElementById('image-loading').classList.add('hidden');
+                                            document.getElementById('generated-image').src = staticUrl;
+                                            document.getElementById('generated-image').classList.remove('hidden');
+                                        };
+                                        fallbackImg.onerror = function() {
+                                            // If all fails, show error
+                                            document.getElementById('image-loading').classList.add('hidden');
+                                            document.getElementById('image-error').classList.remove('hidden');
+                                            document.getElementById('generated-image').src = 'https://via.placeholder.com/800x450/ff6b6b/ffffff?text=Image+Retry+Failed';
+                                            document.getElementById('generated-image').classList.remove('hidden');
+                                        };
+                                        fallbackImg.src = staticUrl;
+                                    };
+                                    img.src = directUrl;
+                                }
+                            })
+                            .catch(() => {
+                                // If validation API fails, try direct load
+                                console.log(`Image validation API failed, trying direct load`);
+                                tryDirectLoad();
+                            });
+                    } else {
+                        // For external images, just try direct load with cache buster
+                        tryDirectLoad();
+                    }
+                    
+                    // Helper function for direct loading
+                    function tryDirectLoad() {
+                        const img = new Image();
+                        img.onload = function() {
+                            document.getElementById('image-loading').classList.add('hidden');
+                            document.getElementById('generated-image').src = newUrl;
+                            document.getElementById('generated-image').classList.remove('hidden');
+                        };
+                        img.onerror = function() {
+                            // If direct load fails, show error but keep the previous image visible
+                            document.getElementById('image-loading').classList.add('hidden');
+                            document.getElementById('image-error').classList.remove('hidden');
+                            document.getElementById('generated-image').classList.remove('hidden');
+                        };
+                        img.src = newUrl;
+                    }
+                    
+                } else {
+                    showError('Cannot retry - original image URL not found');
+                }
             }
         });
     </script>

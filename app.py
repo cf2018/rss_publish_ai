@@ -1,13 +1,24 @@
+"""
+RSS Publishing AI - Flask application for generating AI-powered blog posts from RSS feeds
+"""
 import os
 import re
+import json
 import logging
-from flask import Flask, render_template, request, jsonify, flash, redirect, url_for
-import feedparser
+from flask import Flask, render_template, request, jsonify, send_file
 import google.genai
 from google.genai.types import HarmCategory, HarmBlockThreshold, GenerateImagesConfig, GenerateContentConfig
-import requests
 from dotenv import load_dotenv
-import json
+from io import BytesIO
+from PIL import Image, ImageDraw, ImageFont
+import feedparser
+import uuid  # For generating unique filenames for images
+
+# Import our utility modules
+from utils.text_utils import generate_post_content, parse_rss_feed
+from utils.image_utils import (
+    generate_image, cleanup_temp_images, validate_and_fix_image, get_temp_image_dir
+)
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -19,32 +30,8 @@ load_dotenv()
 app = Flask(__name__)
 app.secret_key = os.getenv('SECRET_KEY', 'your-secret-key-here')
 
-# Create a directory for temporary images
-TEMP_IMG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'static', 'temp')
-os.makedirs(TEMP_IMG_DIR, exist_ok=True)
-
-# Function to clean up old temporary images
-def cleanup_temp_images(max_age_hours=24):
-    """Remove temporary images older than the specified age"""
-    import time
-    import os
-    
-    try:
-        now = time.time()
-        count = 0
-        
-        for filename in os.listdir(TEMP_IMG_DIR):
-            if filename.startswith('generated_') and filename.endswith('.jpg'):
-                file_path = os.path.join(TEMP_IMG_DIR, filename)
-                # If file is older than max_age_hours, delete it
-                if os.path.isfile(file_path) and os.stat(file_path).st_mtime < (now - max_age_hours * 3600):
-                    os.remove(file_path)
-                    count += 1
-        
-        if count > 0:
-            logger.info(f"Cleaned up {count} old temporary image files")
-    except Exception as e:
-        logger.error(f"Error cleaning up temporary images: {e}")
+# Get the directory for temporary images
+TEMP_IMG_DIR = get_temp_image_dir()
 
 # Clean up old images at startup
 cleanup_temp_images()
@@ -74,444 +61,164 @@ class RSSPostGenerator:
     
     def parse_rss_feed(self, rss_url):
         """Parse RSS feed and return list of entries"""
-        try:
-            feed = feedparser.parse(rss_url)
-            entries = []
-            for entry in feed.entries[:10]:  # Limit to 10 most recent entries
-                entries.append({
-                    'title': entry.title,
-                    'description': entry.get('summary', entry.get('description', '')),
-                    'link': entry.link,
-                    'published': entry.get('published', '')
-                })
-            return entries
-        except Exception as e:
-            print(f"Error parsing RSS feed: {e}")
-            return []
+        return parse_rss_feed(rss_url)
     
     def generate_post_content(self, title, description):
         """Generate blog post content using Gemini AI"""
-        logger.info("Starting post content generation")
-        prompt = f"""
-        Create an engaging blog post based on the following as inspiration for a full blog article:
-        Title: {title}
-        Description: {description}
-        
-        🎯 Goal:
-        Turn this into an engaging blog post that would perform well on Medium or similar platforms. Add a catchy title and optional subheading.
-        Use same language and tone as the description, but make it more engaging and structured for a blog post format.
-
-        📌 Write using these style rules:
-
-        * **Use clear, everyday language:** Simple words. Short sentences. Write like a human, not a robot.
-        * **No clichés or hype words:** Avoid terms like “game-changer” or “revolutionize.” Just be real.
-        * **Be direct:** Get to the point fast. Cut the fluff.
-        * **Use a natural voice:** It's okay to start sentences with "But" or "So." Write like you speak.
-        * **Focus on value:** Don’t oversell. Instead, explain the benefit honestly.
-        * **Be human:** Don’t fake excitement. Just share what’s interesting, surprising, or useful.
-        * **Light structure:** Use short paragraphs, subheadings, and maybe a few bullet points.
-        * **Emotion + story welcome:** Share small stories or examples if it helps explain the point.
-        * **Title must be catchy and relevant.**
-
-        ⛔ Avoid:
-        - Robotic or overly formal tone
-        - Long, dense paragraphs
-        - Generic summaries or filler content
-
-        ✅ Do:
-        - Write in first person if it makes sense
-        - Use contractions ("I'm", "it's", etc.)
-        - Keep it scannable and interesting
-
-        Now go ahead and write the blog post. Start with a headline, then dive right into the story or explanation.
-        
-        Also write a compelling image description for AI image generation (detailed, visual, suitable for creating an illustration)
-        
-        Format your response as JSON with keys: "post_content" and "image_description"
-        """
-        try:
-            logger.info(f"Sending request to Gemini API with prompt of {len(prompt)} chars")
-            
-            # Use a default response if the API is slow or fails
-            default_content = f"""
-            <h2>{title}</h2>
-            <p>{description}</p>
-            <p>This is a placeholder blog post content. The AI-generated content will appear here when ready.</p>
-            """
-            
-            # Set a timeout for the request to prevent hanging
-            import threading
-            import time
-            import asyncio
-            import concurrent.futures
-            
-            response_data = [None]
-            response_error = [None]
-            request_completed = [False]
-            
-            def make_request():
-                try:
-                    logger.info("Starting Gemini API request...")
-                    response_data[0] = client.models.generate_content(
-                        model="gemini-2.5-flash",
-                        contents=[prompt]
-                    )
-                    logger.info("Gemini API request completed successfully")
-                    request_completed[0] = True
-                except Exception as e:
-                    logger.error(f"Error in Gemini API request: {e}")
-                    response_error[0] = e
-                    request_completed[0] = True
-            
-            # Start request in a thread
-            request_thread = threading.Thread(target=make_request)
-            request_thread.start()
-            
-            # Wait for up to 30 seconds with status updates
-            timeout = 30  # Increased from 10s to 30s
-            start_time = time.time()
-            
-            # Check progress every second and log it
-            check_interval = 1.0  # Check every second
-            next_check_time = start_time + check_interval
-            
-            while not request_completed[0] and time.time() - start_time < timeout:
-                time.sleep(0.1)
-                
-                # Log progress updates at regular intervals
-                if time.time() >= next_check_time:
-                    elapsed = time.time() - start_time
-                    logger.info(f"Still waiting for Gemini API response... ({elapsed:.1f}s elapsed)")
-                    next_check_time = time.time() + check_interval
-            
-            if not request_completed[0]:
-                logger.warning(f"Request timed out after {timeout} seconds, but will continue in background")
-                # Instead of returning immediately, provide a status message that informs the user
-                # that processing is continuing in the background
-                return {
-                    "post_content": f"""<h2>{title}</h2>
-                    <p>{description}</p>
-                    <div class="bg-yellow-100 border-l-4 border-yellow-500 text-yellow-700 p-4 my-4">
-                        <p class="font-bold">Processing</p>
-                        <p>The AI is still generating content for this topic. This may take a minute or two.</p>
-                        <p>You can try refreshing the page in a moment to see if the content is ready.</p>
-                    </div>""",
-                    "image_description": f"A modern, professional illustration representing: {title}",
-                    "processing": True  # Flag to indicate background processing
-                }
-            
-            if response_error[0]:
-                logger.error(f"Error in generate_content: {response_error[0]}")
-                return {
-                    "post_content": f"""<h2>{title}</h2>
-                    <p>{description}</p>
-                    <div class="bg-red-100 border-l-4 border-red-500 text-red-700 p-4 my-4">
-                        <p class="font-bold">Error</p>
-                        <p>Error generating content: {str(response_error[0])}</p>
-                        <p>Please try again in a few moments.</p>
-                    </div>""",
-                    "image_description": f"A modern, professional illustration representing: {title}"
-                }
-                
-            response = response_data[0]
-            logger.info(f"Response received from Gemini. Has text: {hasattr(response, 'text')}")
-            logger.info(f"Response type: {type(response)}")
-            logger.info(f"Response attributes: {[attr for attr in dir(response) if not attr.startswith('_') and not callable(getattr(response, attr))]}") 
-            
-            # Enhanced response extraction with multiple fallbacks
-            text = None
-            extraction_methods = [
-                # Try all possible ways to extract text from response
-                lambda r: r.text.strip() if hasattr(r, 'text') and r.text else None,
-                lambda r: r.content.strip() if hasattr(r, 'content') and r.content else None,
-                lambda r: r.candidates[0].content.parts[0].text if (hasattr(r, 'candidates') and r.candidates and
-                                                                 hasattr(r.candidates[0], 'content') and
-                                                                 hasattr(r.candidates[0].content, 'parts') and
-                                                                 r.candidates[0].content.parts) else None,
-                lambda r: str(r.candidates[0]) if hasattr(r, 'candidates') and r.candidates else None,
-                lambda r: str(r) if r else None
-            ]
-            
-            # Try each extraction method until we get content
-            for i, extract in enumerate(extraction_methods):
-                try:
-                    extracted_text = extract(response)
-                    if extracted_text:
-                        text = extracted_text
-                        logger.info(f"Got response via extraction method {i+1} ({len(text)} chars)")
-                        break
-                except Exception as e:
-                    logger.warning(f"Extraction method {i+1} failed: {e}")
-            
-            if not text:
-                logger.warning("Could not extract text from response using any method")
-                return {
-                    "post_content": f"""<h2>{title}</h2>
-                    <p>{description}</p>
-                    <div class="bg-red-100 border-l-4 border-red-500 text-red-700 p-4 my-4">
-                        <p class="font-bold">Error</p>
-                        <p>Failed to extract content from the AI response.</p>
-                        <p>Please try again in a few moments.</p>
-                    </div>""",
-                    "image_description": f"A modern, professional illustration representing: {title}"
-                }
-            
-            logger.info(f"Response text first 100 chars: {text[:100]}...")
-            
-            # Try to parse as JSON using multiple approaches
-            result = None
-            
-            # First, try to parse directly as JSON
-            try:
-                logger.info("Attempting to parse response as JSON")
-                result = json.loads(text)
-                logger.info(f"JSON parsing successful: {list(result.keys())}")
-            except json.JSONDecodeError as e:
-                logger.warning(f"JSON parse error: {e}")
-                
-                # Try to extract JSON using regex patterns
-                json_patterns = [
-                    r'```json\s*(.*?)\s*```',  # Code block with json
-                    r'{[\s\S]*?}',             # Find any JSON-like object
-                    r'"post_content"\s*:[\s\S]*?"image_description"\s*:.*?["}]',  # Find specific fields
-                ]
-                
-                for pattern in json_patterns:
-                    try:
-                        matches = re.findall(pattern, text, re.DOTALL)
-                        if matches:
-                            for match in matches:
-                                try:
-                                    # Try to make it valid JSON if it's not complete
-                                    if not match.strip().startswith('{'):
-                                        match = '{' + match + '}'
-                                    # Clean up any trailing commas which can break JSON parsing
-                                    match = re.sub(r',\s*}', '}', match)
-                                    result = json.loads(match)
-                                    logger.info(f"Regex JSON extraction successful with pattern {pattern}: {list(result.keys())}")
-                                    break
-                                except json.JSONDecodeError:
-                                    continue
-                        if result:
-                            break
-                    except Exception as ex:
-                        logger.warning(f"Regex pattern {pattern} failed: {ex}")
-                
-                # If still no valid JSON, try to extract content more aggressively
-                if not result:
-                    logger.warning("Attempting more aggressive extraction of content")
-                    
-                    # Extract image description if possible
-                    image_desc_match = re.search(r'"image_description"[\s:]*"([^"]+)"', text)
-                    image_description = image_desc_match.group(1) if image_desc_match else f"A modern, professional illustration representing: {title}"
-                    
-                    # Try to extract post content - look for common patterns
-                    post_content_patterns = [
-                        r'"post_content"[\s:]*"([\s\S]+?)"(?=,|\})',  # Standard JSON format
-                        r'<h[1-6]>([\s\S]+?)</h[1-6]>',               # Look for HTML headings
-                        r'# (.*?)\n',                                # Markdown headings
-                    ]
-                    
-                    post_content = None
-                    for pattern in post_content_patterns:
-                        match = re.search(pattern, text)
-                        if match:
-                            post_content = match.group(1)
-                            break
-                    
-                    if not post_content:
-                        # If we still couldn't extract content, use the whole text
-                        post_content = text
-                    
-                    result = {
-                        "post_content": post_content,
-                        "image_description": image_description
-                    }
-                    logger.info("Created result with aggressive content extraction")
-            
-            # Ensure result has required keys
-            if not result.get("post_content"):
-                logger.warning("Result missing post_content, adding default")
-                result["post_content"] = f"Blog post about: {title}\n\n{description}"
-            if not result.get("image_description"):
-                logger.warning("Result missing image_description, adding default")
-                result["image_description"] = f"A modern, professional illustration representing: {title}"
-            
-            logger.info("Post content generation completed successfully")    
-            return result
-        except Exception as e:
-            logger.error(f"Error generating content: {e}", exc_info=True)
-            return {
-                "post_content": f"Blog post about: {title}\n\n{description}",
-                "image_description": f"An illustration representing {title}"
-            }
+        return generate_post_content(client, title, description)
     
     def generate_image(self, image_description):
         """Generate an image using Gemini image generation model based on the description."""
         try:
-            logger.info(f"Attempting to use Gemini model '{IMAGE_GENERATION_MODEL}' for image generation")
+            logger.info(f"Using Gemini model '{IMAGE_GENERATION_MODEL}' for image generation")
             logger.info(f"Image description: {image_description[:100]}...")
-            
-            # Create a simplified and shortened image description for better image generation
-            # This helps avoid overly specific details that might confuse image generation
+
+            # Simplify the image description for better generation
             simplified_description = self._simplify_image_description(image_description)
             logger.info(f"Simplified image description: {simplified_description}")
-            
-            # Try multiple image services in order of preference
-            image_services = [
-                self._try_unsplash_image,
-                self._try_pexels_image,
-                self._try_picsum_image
-            ]
-            
-            for service in image_services:
-                try:
-                    result = service(simplified_description)
-                    if result and result.get('status') == 'success':
-                        logger.info(f"Successfully generated image using {result.get('source')}")
-                        return result
-                except Exception as e:
-                    logger.warning(f"Image service failed: {str(e)}")
-                    continue
-            
-            # If all image services fail, use placeholder generator
-            return self._generate_placeholder_image(simplified_description)
-            
-        except Exception as e:
+
+            # Attempt text-to-image generation first
+            try:
+                logger.info(f"🔄 Attempting text-to-image generation with {IMAGE_GENERATION_MODEL}...")
+                response = client.models.generate_content(
+                    model=IMAGE_GENERATION_MODEL,
+                    contents=[simplified_description],
+                    config=GenerateContentConfig(
+                        response_modalities=["IMAGE", "TEXT"],
+                        temperature=0.3,  # Slightly higher for creative text placement
+                        max_output_tokens=2048,
+                        candidate_count=1
+                    )
+                )
+                logger.info("✅ Text-to-image generation request sent successfully")
+
+                # Extract image data from the response
+                if hasattr(response, 'candidates') and response.candidates:
+                    candidate = response.candidates[0]
+                    if hasattr(candidate, 'content') and candidate.content.parts:
+                        for part in candidate.content.parts:
+                            if hasattr(part, 'inline_data') and part.inline_data:
+                                image_data = part.inline_data.data
+                                mime_type = part.inline_data.mime_type
+                                extension = mime_type.split('/')[-1]  # Extract file extension from MIME type
+                                filename = f"generated_{uuid.uuid4().hex}.{extension}"
+                                file_path = os.path.join(TEMP_IMG_DIR, filename)
+                                with open(file_path, "wb") as f:
+                                    f.write(image_data)
+
+                                logger.info(f"Successfully generated image using Gemini and saved to {file_path}")
+
+                                return {
+                                    "image_url": f"/static/temp/{filename}",
+                                    "status": "success",
+                                    "source": "gemini",
+                                    "local_path": file_path,
+                                    "message": "Generated image using Gemini AI"
+                                }
+                        logger.error(f"No inline_data found in the candidate parts: {candidate.content.parts}")
+                        raise ValueError("No image data found in the candidate response")
+                    else:
+                        logger.error(f"Candidate does not contain valid content parts: {candidate}")
+                        raise ValueError("No image data found in the candidate response")
+                else:
+                    logger.error(f"Response does not contain candidates or is malformed: {response}")
+                    raise ValueError("No candidates found in the response")
+
+            except Exception as text_to_image_error:
+                logger.warning(f"⚠️  Text-to-image model failed: {text_to_image_error}")
+                logger.info("🔄 Falling back to image generation model with modified prompt...")
+
+                # Modify the prompt for fallback
+                fallback_prompt = f"Professional studio photograph of {simplified_description}.\n\nRequirements:\n- High quality product photography\n- Professional studio lighting with soft shadows\n- Clean, professional look suitable for advertising\n- No text or watermarks on the image"
+
+                # Dynamically select a valid model for image generation
+                available_models = client.models.list()
+                logger.info("Available models for fallback:")
+                for model in available_models:
+                    logger.info(f"Model: {model.name}, Supported Actions: {model.supported_actions}")
+
+                # Adjust fallback logic to use models supporting 'generateContent'
+                valid_model = next((model.name for model in available_models if "generateContent" in model.supported_actions), IMAGE_GENERATION_MODEL)
+
+                if not valid_model:
+                    raise ValueError("No valid image generation model found. Ensure the model supports 'generateContent'.")
+
+                logger.info(f"Using fallback model: {valid_model}")
+
+                # Generate the image using fallback approach
+                response = client.models.generate_content(
+                    model=valid_model,
+                    contents=[fallback_prompt],
+                    config=GenerateContentConfig(
+                        response_modalities=["IMAGE", "TEXT"],
+                        temperature=0.1,  # Low temperature for consistent results
+                        max_output_tokens=2048,
+                        candidate_count=1
+                    )
+                )
+
+                # Extract image data from the response
+                if hasattr(response, 'candidates') and response.candidates:
+                    candidate = response.candidates[0]
+                    if hasattr(candidate, 'content') and candidate.content.parts:
+                        for part in candidate.content.parts:
+                            logger.debug(f"Inspecting part: {part}")
+                            if hasattr(part, 'inline_data') and part.inline_data:
+                                logger.info(f"Found inline_data with MIME type: {part.inline_data.mime_type}")
+                                image_data = part.inline_data.data
+                                mime_type = part.inline_data.mime_type
+                                extension = mime_type.split('/')[-1]  # Extract file extension from MIME type
+                                filename = f"generated_{uuid.uuid4().hex}.{extension}"
+                                file_path = os.path.join(TEMP_IMG_DIR, filename)
+                                with open(file_path, "wb") as f:
+                                    f.write(image_data)
+
+                                logger.info(f"Successfully generated image using fallback model and saved to {file_path}")
+
+                                return {
+                                    "image_url": f"/static/temp/{filename}",
+                                    "status": "success",
+                                    "source": "gemini",
+                                    "local_path": file_path,
+                                    "message": "Generated image using fallback model"
+                                }
+                        logger.error(f"No valid inline_data found in candidate parts: {candidate.content.parts}")
+                        raise ValueError("No image data found in the candidate response")
+                    else:
+                        logger.error(f"Candidate does not contain valid content parts: {candidate}")
+                        raise ValueError("No image data found in the candidate response")
+                else:
+                    logger.error(f"Response does not contain candidates or is malformed: {response}")
+                    raise ValueError("No candidates found in the response")
+
+        except google.genai.errors.ClientError as e:
+            if "NOT_FOUND" in str(e):
+                logger.error("Model not found. Listing available models for debugging.")
+                self.list_available_models()
             logger.error(f"Error in image generation: {e}", exc_info=True)
-            return self._generate_placeholder_image(image_description)
+            return {
+                "image_url": "https://via.placeholder.com/800x450/ff0000/ffffff?text=Error+Occurred",
+                "status": "error",
+                "source": "gemini",
+                "message": f"Error generating image: {str(e)}"
+            }
     
-    def _try_unsplash_image(self, description):
-        """Try to get an image from Unsplash based on description"""
-        try:
-            import uuid
-            import requests
-            from io import BytesIO
-            from PIL import Image
-            
-            # Generate a clean search term from the description
-            search_terms = description
-            unsplash_url = f"https://source.unsplash.com/1200x628/?{search_terms.replace(' ', '+')}"
-            logger.info(f"Fetching image from Unsplash with URL: {unsplash_url}")
-            
-            # Get the image from Unsplash (which redirects to an actual image)
-            response = requests.get(unsplash_url, allow_redirects=True, timeout=10)
-            if response.status_code == 200:
-                # Generate a unique filename
-                filename = f"generated_{uuid.uuid4().hex}.jpg"
-                file_path = os.path.join(TEMP_IMG_DIR, filename)
-                
-                # Process and save the image
-                img = Image.open(BytesIO(response.content))
-                img.save(file_path, "JPEG")
-                
-                logger.info(f"Successfully downloaded and saved image to {file_path}")
-                
-                # Return the local image URL
-                return {
-                    "image_url": f"/static/temp/{filename}",
-                    "status": "success",
-                    "source": "unsplash",
-                    "local_path": file_path,
-                    "message": "Generated image based on your description"
-                }
-            else:
-                logger.warning(f"Failed to get image from Unsplash: Status code {response.status_code}")
-                return None
-        except Exception as e:
-            logger.error(f"Error downloading image from Unsplash: {e}")
-            return None
+    def _simplify_image_description(self, description):
+        """Simplify the image description for better image generation."""
+        # Basic simplification: remove extra spaces and limit to 200 characters
+        simplified = re.sub(r'\s+', ' ', description).strip()
+        return simplified[:200]  # Limit to 200 characters
     
-    def _try_pexels_image(self, description):
-        """Try to get an image from Pexels based on description"""
+    def list_available_models(self):
+        """List available models and log them for debugging purposes."""
         try:
-            import uuid
-            import requests
-            import random
-            from io import BytesIO
-            from PIL import Image
-            
-            # Since we don't have a Pexels API key, we'll use a curated list of nature/landscape images
-            # This is a fallback when we can't connect to other services
-            pexels_images = [
-                "https://images.pexels.com/photos/2559941/pexels-photo-2559941.jpeg",
-                "https://images.pexels.com/photos/15286/pexels-photo.jpg",
-                "https://images.pexels.com/photos/358457/pexels-photo-358457.jpeg",
-                "https://images.pexels.com/photos/417074/pexels-photo-417074.jpeg",
-                "https://images.pexels.com/photos/247600/pexels-photo-247600.jpeg",
-                "https://images.pexels.com/photos/624015/pexels-photo-624015.jpeg",
-                "https://images.pexels.com/photos/5534242/pexels-photo-5534242.jpeg",
-                "https://images.pexels.com/photos/3861969/pexels-photo-3861969.jpeg"
-            ]
-            
-            # Randomly select an image
-            image_url = random.choice(pexels_images)
-            logger.info(f"Using random Pexels image: {image_url}")
-            
-            # Download the image
-            response = requests.get(image_url, timeout=10)
-            if response.status_code == 200:
-                # Generate a unique filename
-                filename = f"generated_{uuid.uuid4().hex}.jpg"
-                file_path = os.path.join(TEMP_IMG_DIR, filename)
-                
-                # Save the image
-                img = Image.open(BytesIO(response.content))
-                img.save(file_path, "JPEG")
-                
-                logger.info(f"Successfully downloaded and saved Pexels image to {file_path}")
-                
-                # Return the local image URL
-                return {
-                    "image_url": f"/static/temp/{filename}",
-                    "status": "success",
-                    "source": "pexels",
-                    "local_path": file_path,
-                    "message": "Used relevant stock image (Pexels)"
-                }
-            else:
-                logger.warning(f"Failed to get image from Pexels: Status code {response.status_code}")
-                return None
+            logger.info("Fetching available models...")
+            models = client.models.list()
+            for model in models:
+                logger.info(f"Model object: {model}")  # Log the entire model object for debugging
         except Exception as e:
-            logger.error(f"Error downloading image from Pexels: {e}")
-            return None
-    
-    def _try_picsum_image(self, description):
-        """Try to get a random image from Picsum"""
-        try:
-            import uuid
-            import requests
+            logger.error(f"Error fetching available models: {e}", exc_info=True)
             
-            # Try Picsum as a backup image source
-            picsum_url = f"https://picsum.photos/1200/628"
-            response = requests.get(picsum_url, timeout=10)
-            
-            if response.status_code == 200:
-                # Generate a unique filename
-                filename = f"generated_{uuid.uuid4().hex}.jpg"
-                file_path = os.path.join(TEMP_IMG_DIR, filename)
-                
-                # Save the image
-                with open(file_path, 'wb') as f:
-                    f.write(response.content)
-                
-                logger.info(f"Successfully downloaded and saved image from Picsum to {file_path}")
-                
-                # Return the local image URL
-                return {
-                    "image_url": f"/static/temp/{filename}",
-                    "status": "success",
-                    "source": "picsum",
-                    "local_path": file_path,
-                    "message": "Generated random image (image service fallback)"
-                }
-            else:
-                logger.warning(f"Failed to get image from Picsum: Status code {response.status_code}")
-                return None
-        except Exception as e:
-            logger.error(f"Error downloading image from Picsum: {e}")
-            return None
-        
 
 # Initialize the generator
 generator = RSSPostGenerator()
@@ -690,7 +397,7 @@ def check_image_model():
 
 @app.route('/generated-image/<filename>', methods=['GET'])
 def generated_image(filename):
-    """Serve a generated image directly"""
+    """Serve a generated image directly with on-the-fly validation and fixing"""
     try:
         # Security check to prevent directory traversal attacks
         if '..' in filename or filename.startswith('/'):
@@ -704,18 +411,216 @@ def generated_image(filename):
         
         # Check if file exists
         if not os.path.isfile(file_path):
-            return "File not found", 404
+            # Create a special "not found" image
+            try:
+                from PIL import Image, ImageDraw, ImageFont
+                
+                # Create a simple "not found" image
+                img = Image.new('RGB', (800, 450), color=(238, 238, 238))
+                draw = ImageDraw.Draw(img)
+                
+                # Try to load a font
+                try:
+                    font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 36)
+                    small_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 24)
+                except Exception:
+                    font = ImageFont.load_default()
+                    small_font = ImageFont.load_default()
+                
+                # Add text
+                draw.text((400, 200), "Image Not Found", font=font, fill=(33, 33, 33), anchor="mm")
+                draw.text((400, 250), filename, font=small_font, fill=(100, 100, 100), anchor="mm")
+                
+                # Add border
+                draw.rectangle([(0, 0), (799, 449)], outline=(200, 200, 200), width=5)
+                
+                from io import BytesIO
+                img_io = BytesIO()
+                img.save(img_io, 'JPEG', quality=95)
+                img_io.seek(0)
+                
+                return send_file(img_io, mimetype='image/jpeg')
+            except Exception as nf_err:
+                logger.error(f"Error creating not found image: {nf_err}")
+                return "File not found", 404
+            
+        # Attempt to validate and fix the image
+        if not validate_and_fix_image(file_path):
+            logger.warning(f"Image validation failed for {filename}, attempting to serve anyway")
             
         # Determine content type
         content_type = 'image/jpeg'
         if filename.lower().endswith('.png'):
             content_type = 'image/png'
             
-        from flask import send_file
-        return send_file(file_path, mimetype=content_type)
+        # Add cache control headers to prevent browser caching
+        response = send_file(file_path, mimetype=content_type)
+        response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
+        response.headers['Pragma'] = 'no-cache'
+        response.headers['Expires'] = '0'
+        
+        return response
     except Exception as e:
         logger.error(f"Error serving image file: {e}")
-        return "Internal server error", 500
+        
+        # Try to create a simple error image
+        try:
+            from PIL import Image, ImageDraw, ImageFont
+            from io import BytesIO
+            
+            # Create a simple error image
+            img = Image.new('RGB', (800, 450), color=(255, 240, 240))
+            draw = ImageDraw.Draw(img)
+            
+            # Try to load a font
+            try:
+                font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 36)
+                small_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 20)
+            except Exception:
+                font = ImageFont.load_default()
+                small_font = ImageFont.load_default()
+            
+            # Add text
+            draw.text((400, 180), "Error Loading Image", font=font, fill=(200, 0, 0), anchor="mm")
+            
+            error_text = str(e)
+            if len(error_text) > 60:
+                error_text = error_text[:57] + "..."
+                
+            draw.text((400, 240), error_text, font=small_font, fill=(100, 0, 0), anchor="mm")
+            draw.text((400, 280), filename, font=small_font, fill=(100, 0, 0), anchor="mm")
+            
+            # Add border
+            draw.rectangle([(0, 0), (799, 449)], outline=(255, 0, 0), width=5)
+            
+            img_io = BytesIO()
+            img.save(img_io, 'JPEG', quality=95)
+            img_io.seek(0)
+            
+            return send_file(img_io, mimetype='image/jpeg')
+        except:
+            return "Internal server error", 500
+
+@app.route('/api/check-image/<filename>', methods=['GET'])
+def check_image(filename):
+    """Check if an image exists and is valid"""
+    try:
+        # Security check to prevent directory traversal attacks
+        if '..' in filename or filename.startswith('/'):
+            return jsonify({'error': 'Invalid filename', 'valid': False}), 400
+            
+        # Only allow jpg/jpeg/png files
+        if not filename.lower().endswith(('.jpg', '.jpeg', '.png')):
+            return jsonify({'error': 'Invalid file type', 'valid': False}), 400
+            
+        file_path = os.path.join(TEMP_IMG_DIR, filename)
+        
+        # Check if file exists
+        if not os.path.exists(file_path):
+            return jsonify({
+                'error': 'File not found',
+                'valid': False,
+                'filename': filename,
+                'requested_path': file_path
+            }), 404
+            
+        # Check if file is valid image
+        try:
+            from PIL import Image
+            
+            # Get file size
+            file_size = os.path.getsize(file_path)
+            if file_size == 0:
+                return jsonify({
+                    'error': 'Empty file',
+                    'valid': False,
+                    'filename': filename,
+                    'size': 0
+                }), 400
+                
+            # Open the image to check format and get properties
+            img = Image.open(file_path)
+            width, height = img.size
+            img_format = img.format
+            img_mode = img.mode
+            
+            # Try to fully load image data to verify it's not corrupt
+            img.load()
+            
+            # Check for reasonable dimensions
+            if width < 10 or height < 10:
+                return jsonify({
+                    'error': 'Image too small',
+                    'valid': False,
+                    'filename': filename,
+                    'dimensions': f'{width}x{height}',
+                    'format': img_format,
+                    'mode': img_mode,
+                    'size': file_size
+                }), 400
+            
+            # Get paths for both access methods
+            static_path = f'/static/temp/{filename}'
+            direct_path = f'/generated-image/{filename}'
+            
+            # Return successful validation with metadata
+            return jsonify({
+                'valid': True,
+                'filename': filename,
+                'path': static_path,
+                'direct_path': direct_path,
+                'size': file_size,
+                'dimensions': f'{width}x{height}',
+                'format': img_format,
+                'mode': img_mode
+            })
+        except Exception as img_error:
+            logger.error(f"Invalid image file: {filename}, Error: {img_error}")
+            
+            # Attempt to fix the image
+            try:
+                # Use the validation and fix function
+                if validate_and_fix_image(file_path):
+                    # Try opening the image again after fixing
+                    img = Image.open(file_path)
+                    width, height = img.size
+                    img_format = img.format
+                    img_mode = img.mode
+                    file_size = os.path.getsize(file_path)
+                    
+                    # Return success with warning about the fix
+                    return jsonify({
+                        'valid': True,
+                        'filename': filename,
+                        'path': f'/static/temp/{filename}',
+                        'direct_path': f'/generated-image/{filename}',
+                        'size': file_size,
+                        'dimensions': f'{width}x{height}',
+                        'format': img_format,
+                        'mode': img_mode,
+                        'warning': 'Image was fixed during validation'
+                    })
+                else:
+                    # If fixing failed
+                    return jsonify({
+                        'error': f'Invalid image file: {str(img_error)}',
+                        'valid': False,
+                        'filename': filename,
+                        'fix_attempted': True,
+                        'fix_successful': False
+                    }), 400
+            except Exception as fix_error:
+                # If the fix attempt failed
+                return jsonify({
+                    'error': f'Invalid image file and fix failed: {str(fix_error)}',
+                    'valid': False,
+                    'filename': filename,
+                    'original_error': str(img_error)
+                }), 400
+            
+    except Exception as e:
+        logger.error(f"Error checking image {filename}: {e}")
+        return jsonify({'error': str(e), 'valid': False}), 500
 
 if __name__ == '__main__':
     app.run(debug=True, port=5001)
